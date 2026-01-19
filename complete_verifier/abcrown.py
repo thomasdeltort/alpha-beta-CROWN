@@ -60,6 +60,7 @@ class ABCROWN:
             else:
                 args.append(f'--{k}={v}')
         arguments.Config.parse_config(args)
+        # import pdb;pdb.set_trace()
 
     def incomplete_verifier(
         self,
@@ -134,7 +135,8 @@ class ABCROWN:
                 if node.are_output_constraints_activated_for_layer(apply_output_constraints_to):
                     if isinstance(node, BoundConv) and node.mode == 'patches':
                         node.mode = 'matrix'
-
+        # TOCHECK HERE where we enter the loop and which eps we use
+        # import pdb; pdb.set_trace()
         if isinstance(input_x, dict):
             # Traditional Lp norm case. Still passed in as an vnnlib variable, but it is passed
             # in as a dictionary.
@@ -675,12 +677,15 @@ class ABCROWN:
 
             # FIXME attack and initial_incomplete_verification only works for
             # assert len(vnnlib) == 1
+            # import pdb;pdb.set_trace()
+
             if isinstance(vnnlib[0][0], dict):
                 x = vnnlib[0][0]['X'].reshape(vnnlib_shape)
                 data_min = vnnlib[0][0]['data_min'].reshape(vnnlib_shape)
                 data_max = vnnlib[0][0]['data_max'].reshape(vnnlib_shape)
             else:
                 x_range = torch.tensor(vnnlib[0][0])
+                #TOCHECK here what is x_range
                 data_min = x_range.select(-1, 0).reshape(vnnlib_shape)
                 data_max = x_range.select(-1, 1).reshape(vnnlib_shape)
                 x = x_range.mean(-1).reshape(vnnlib_shape)  # only the shape of x is important.

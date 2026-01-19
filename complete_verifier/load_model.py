@@ -320,8 +320,7 @@ def load_model(weights_loaded=True):
         if arguments.Config["model"]["path"] is not None:
             # Load pytorch model
             # You can customize this function to load your own model based on model name.
-            sd = torch.load(expand_path(arguments.Config["model"]["path"]),
-                            map_location=torch.device('cpu'))
+            sd = torch.load(expand_path(arguments.Config["model"]["path"]), map_location=torch.device('cpu'))
             if 'state_dict' in sd:
                 sd = sd['state_dict']
             if isinstance(sd, list):

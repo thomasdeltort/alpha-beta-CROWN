@@ -37,8 +37,12 @@ def preprocess_cifar(image, inception_preprocess=False, perturbation=False):
     """
     Preprocess images and perturbations.Preprocessing used by the SDP paper.
     """
-    MEANS = np.array([125.3, 123.0, 113.9], dtype=np.float32)/255
-    STD = np.array([63.0, 62.1, 66.7], dtype=np.float32)/255
+    # MEANS = np.array([125.3, 123.0, 113.9], dtype=np.float32)/255
+    # STD = np.array([63.0, 62.1, 66.7], dtype=np.float32)/255
+    
+    # MEANS = np.array([125.3, 123.0, 113.9], dtype=np.float32)/255
+    MEANS = np.array([0.4914, 0.4822, 0.4465], dtype=np.float32)
+    STD = np.array([0.225, 0.225, 0.225], dtype=np.float32)
     if inception_preprocess:
         # Use 2x - 1 to get [-1, 1]-scaled images
         rescaled_devs = 0.5

@@ -798,6 +798,7 @@ def attack_pgd(model, X, y, epsilon, alpha, attack_iters, num_restarts,
         multi_targeted=True, num_classes=10, use_adam=True, lr_decay=0.98,
         lower_limit=0.0, upper_limit=1.0, normalize=lambda x: x, early_stop=True, target=None,
         initialization='uniform', GAMA_loss=False, nn4sys=False):
+    # import pdb;pdb.set_trace()
     if initialization == 'osi':
         if multi_targeted:
             extra_dim = (num_restarts, num_classes - 1,)
