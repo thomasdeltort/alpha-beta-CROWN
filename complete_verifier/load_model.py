@@ -290,6 +290,216 @@ def debug_onnx(onnx_model, pytorch_model, dummy_input):
     import pdb; pdb.set_trace()
 
 
+# def load_model(weights_loaded=True):
+#     """
+#     Load the model architectures and weights
+#     """
+
+#     assert arguments.Config["model"]["name"] is None or arguments.Config["model"]["onnx_path"] is None, (
+#         "Conflict detected! User should specify model path by either --model or --onnx_path! "
+#         "The cannot be both specified.")
+
+#     assert arguments.Config["model"]["name"] is not None or arguments.Config["model"]["onnx_path"] is not None, (
+#         "No model is loaded, please set --model <modelname> for pytorch model or --onnx_path <filename> for onnx model.")
+
+#     if arguments.Config['model']['name'] is not None:
+#         # You can customize this function to load your own model based on model name.
+#         try:
+#             model_ori = eval(arguments.Config['model']['name'])()  # pylint: disable=eval-used
+#         except Exception:  # pylint: disable=broad-except
+#             print(f'Cannot load pytorch model definition "{arguments.Config["model"]["name"]}()". '
+#                   f'"{arguments.Config["model"]["name"]}()" must be a callable that returns a torch.nn.Module object.')
+#             import traceback
+#             traceback.print_exc()
+#             exit()
+#         model_ori.eval()
+
+#         if not weights_loaded:
+#             return model_ori
+
+#         if arguments.Config["model"]["path"] is not None:
+#             # Load pytorch model
+#             # You can customize this function to load your own model based on model name.
+#             sd = torch.load(expand_path(arguments.Config["model"]["path"]), map_location=torch.device('cpu'))
+#             if 'state_dict' in sd:
+#                 sd = sd['state_dict']
+#             if isinstance(sd, list):
+#                 sd = sd[0]
+#             if not isinstance(sd, dict):
+#                 raise NotImplementedError("Unknown model format, please modify model loader yourself.")
+#             try:
+#                 model_ori.load_state_dict(sd)
+#             except RuntimeError:
+#                 print('Failed to load the model')
+#                 print('Keys in the state_dict of model_ori:')
+#                 print(list(model_ori.state_dict().keys()))
+#                 print('Keys in the state_dict trying to load:')
+#                 print(list(sd.keys()))
+#                 raise
+
+#     elif arguments.Config["model"]["onnx_path"] is not None:
+#         # Load onnx model
+#         model_ori, _ = load_model_onnx(expand_path(
+#             arguments.Config["model"]["onnx_path"]))
+
+#     else:
+#         print("Warning: pretrained model path is not given!")
+
+#     print(model_ori)
+#     print('Parameters:')
+#     for p in model_ori.named_parameters():
+#         print(f'  {p[0]}: shape {p[1].shape}')
+
+#     return model_ori
+import torch
+import torch.nn as nn
+import arguments
+from utils import expand_path  # Assuming expand_path is in the same file or imported
+# Add other necessary imports from your existing file here (e.g., load_model_onnx)
+
+# =============================================================================
+#  VERIFICATION HELPERS (Added for Model Swapping)
+# =============================================================================
+
+class GroupSort(nn.Module):
+    """
+    Universal GroupSort (1-Lipschitz).
+    
+    - If input is 4D (N, C, H, W): Acts as a 1x1 Convolution (Spatial).
+    - If input is 2D (N, C): Acts as a Linear layer (Dense).
+    
+    Implemented via Conv2d weights to ensure maximum compatibility with 
+    Auto_LiRPA's bound propagation graph.
+    """
+    def __init__(self, channels, axis=1):
+        super().__init__()
+        # Auto_LiRPA verification usually targets the channel axis (1).
+        if axis != 1:
+            raise ValueError("GroupSort axis must be 1 (Channel).")
+        
+        if channels % 2 != 0:
+            raise ValueError(f"Channels must be even, got {channels}")
+            
+        self.channels = channels
+        
+        # We use Conv2d(1x1) as the core engine. 
+        # For 2D inputs, we simply unsqueeze dimensions to fit this engine.
+        self.conv_diff = nn.Conv2d(channels, channels // 2, kernel_size=1, bias=False)
+        self.conv_expand = nn.Conv2d(channels // 2, channels, kernel_size=1, bias=False)
+        
+        # Freeze weights
+        self.conv_diff.weight.requires_grad = False
+        self.conv_expand.weight.requires_grad = False
+        self._init_weights()
+
+    def _init_weights(self):
+        with torch.no_grad():
+            # 1. Diff Conv: Calculate (Even - Odd)
+            self.conv_diff.weight.fill_(0)
+            for k in range(self.channels // 2):
+                self.conv_diff.weight[k, 2*k, 0, 0] = 1.0     # Even
+                self.conv_diff.weight[k, 2*k + 1, 0, 0] = -1.0 # Odd
+            
+            # 2. Expand Conv: Apply corrections
+            self.conv_expand.weight.fill_(0)
+            for k in range(self.channels // 2):
+                # If (Even > Odd), subtract difference from Even (swap)
+                self.conv_expand.weight[2*k, k, 0, 0] = -1.0
+                # If (Even > Odd), add difference to Odd (swap)
+                self.conv_expand.weight[2*k + 1, k, 0, 0] = 1.0
+
+    def forward(self, x):
+        # 1. Detect Input Type
+        is_2d = (x.dim() == 2)
+        
+        if is_2d:
+            # Case: Linear Layer Output (N, C)
+            # We reshape to (N, C, 1, 1) so it looks like an image pixel.
+            # This is safe for verification because there is no spatial structure to lose.
+            x_reshaped = x.view(*x.shape, 1, 1)
+        else:
+            # Case: Conv Layer Output (N, C, H, W)
+            # Use as is.
+            x_reshaped = x
+
+        # 2. Sort Logic (Identical for both)
+        diff = self.conv_diff(x_reshaped)
+        activation = torch.relu(diff)
+        correction = self.conv_expand(activation)
+        out_reshaped = x_reshaped + correction
+        
+        # 3. Restore Output Shape
+        if is_2d:
+            # Reshape (N, C, 1, 1) back to (N, C)
+            return out_reshaped.view(x.shape)
+        else:
+            return out_reshaped
+
+def replace_groupsort(model, dummy_input):
+    """
+    Replaces GroupSort_General (Reshape-based) layers with GroupSort (Conv1x1-based).
+    """
+    # Dictionary to store (layer_name -> input_channels)
+    layer_configs = {}
+    hooks = []
+
+    # 1. Define Hook to capture shapes
+    def get_shape_hook(name):
+        def hook(module, input, output):
+            # Input is a tuple, take the first element
+            shape = input[0].shape
+            channels = shape[1] 
+            layer_configs[name] = channels
+        return hook
+
+    # 2. Register hooks on all GroupSort layers
+    # We check string name to avoid needing to import GroupSort_General class
+    for name, module in model.named_modules():
+        if "GroupSort" in str(type(module)):
+            hooks.append(module.register_forward_hook(get_shape_hook(name)))
+
+    # 3. Run Dummy Pass to trigger hooks
+    training_state = model.training
+    model.eval()
+    with torch.no_grad():
+        try:
+            model(dummy_input)
+        except Exception as e:
+            print(f"Warning: Dummy pass in replace_groupsort failed: {e}")
+            # Clean up hooks even if it fails
+            for h in hooks: h.remove()
+            return model
+
+    # 4. Remove hooks
+    for h in hooks:
+        h.remove()
+    model.train(training_state)
+
+    # 5. Perform Replacement
+    if not layer_configs:
+        # No GroupSort layers found, return original model
+        return model
+
+    print(f"[replace_groupsort] Found {len(layer_configs)} GroupSort layers to swap.")
+    
+    for name, module in model.named_modules():
+        for child_name, _ in module.named_children():
+            full_child_name = f"{name}.{child_name}" if name else child_name
+            
+            if full_child_name in layer_configs:
+                channels = layer_configs[full_child_name]
+                axis = 1 
+                
+                # print(f"  -> Replacing {full_child_name} (Channels={channels})")
+                new_layer = GroupSort(channels=channels, axis=axis)
+                setattr(module, child_name, new_layer)
+
+    return model
+
+# =============================================================================
+#  UPDATED LOAD_MODEL
+# =============================================================================
+
 def load_model(weights_loaded=True):
     """
     Load the model architectures and weights
@@ -312,6 +522,7 @@ def load_model(weights_loaded=True):
             import traceback
             traceback.print_exc()
             exit()
+        
         model_ori.eval()
 
         if not weights_loaded:
@@ -319,7 +530,7 @@ def load_model(weights_loaded=True):
 
         if arguments.Config["model"]["path"] is not None:
             # Load pytorch model
-            # You can customize this function to load your own model based on model name.
+            print(f"Loading state dict from: {arguments.Config['model']['path']}")
             sd = torch.load(expand_path(arguments.Config["model"]["path"]), map_location=torch.device('cpu'))
             if 'state_dict' in sd:
                 sd = sd['state_dict']
@@ -336,6 +547,38 @@ def load_model(weights_loaded=True):
                 print('Keys in the state_dict trying to load:')
                 print(list(sd.keys()))
                 raise
+
+            # =========================================================================
+            # [CRITICAL FIX] SWAP ARCHITECTURE FOR VERIFICATION (GroupSort -> Conv1x1)
+            # =========================================================================
+            print("[load_model] 🔄 Applying Architecture Swap (GroupSort General -> Conv1x1)...")
+            
+            # 1. Generate a dummy input to infer shapes (required by replace_groupsort)
+            # Try to fetch input shape from config, default to CIFAR-10 shape (3, 32, 32)
+            model_name = arguments.Config["model"].get("name", "").lower()
+           
+            if "mnist" in model_name:
+                # MNIST / Fashion-MNIST: Grayscale 28x28
+                input_shape = (1, 1, 28, 28)
+                print(f"[load_model] 📉 Detected MNIST/Grayscale model: {model_name}")
+            else:
+                # Default (CIFAR-10 / CIFAR-100 / TinyImageNet): RGB 32x32
+                input_shape = (1, 3, 32, 32)
+                print(f"[load_model] 📉 Detected CIFAR/RGB model: {model_name}")
+            
+            # 2. Create Dummy Input
+            # We already defined full 4D shape (N, C, H, W), so we can pass it directly
+            dummy_input = torch.zeros(*input_shape)
+            
+            # 2. Perform the swap
+            try:
+                model_ori = replace_groupsort(model_ori, dummy_input)
+                print("[load_model] ✅ Swap successful. Model is now verifier-friendly.")
+            except Exception as e:
+                print(f"[load_model] ❌ Error during model swap: {e}")
+                import traceback
+                traceback.print_exc()
+            # =========================================================================
 
     elif arguments.Config["model"]["onnx_path"] is not None:
         # Load onnx model
